@@ -1,0 +1,70 @@
+version: '3.8'
+
+networks:
+  inkraft-net:
+    driver: bridge
+
+services:
+  replica1:
+    build:
+      context: ./replica1
+    container_name: inkraft-replica1
+    platform: linux/amd64
+    ports:
+      - "8001:8001"
+    environment:
+      - REPLICA_ID=1
+      - PORT=8001
+      - PEERS=http://replica2:8002,http://replica3:8003
+    volumes:
+      - ./replica1:/app
+    networks:
+      - inkraft-net
+
+  replica2:
+    build:
+      context: ./replica2
+    container_name: inkraft-replica2
+    platform: linux/amd64
+    ports:
+      - "8002:8002"
+    environment:
+      - REPLICA_ID=2
+      - PORT=8002
+      - PEERS=http://replica1:8001,http://replica3:8003
+    volumes:
+      - ./replica2:/app
+    networks:
+      - inkraft-net
+
+  replica3:
+    build:
+      context: ./replica3
+    container_name: inkraft-replica3
+    platform: linux/amd64
+    ports:
+      - "8003:8003"
+    environment:
+      - REPLICA_ID=3
+      - PORT=8003
+      - PEERS=http://replica1:8001,http://replica2:8002
+    volumes:
+      - ./replica3:/app
+    networks:
+      - inkraft-net
+
+  gateway:
+    build:
+      context: ./gateway
+    container_name: inkraft-gateway
+    platform: linux/amd64
+    ports:
+      - "9000:9000"
+    volumes:
+      - ./gateway:/app
+    depends_on:
+      - replica1
+      - replica2
+      - replica3
+    networks:
+      - inkraft-net
