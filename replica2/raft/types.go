@@ -55,3 +55,26 @@ type HeartbeatRequest struct {
 	LeaderID     string `json:"leaderId"`
 	LeaderCommit int    `json:"leaderCommit"`
 }
+
+type SyncLogRequest struct {
+	FromIndex int `json:"fromIndex"`
+}
+
+type SyncLogResponse struct {
+	Entries []LogEntry `json:"entries"`
+}
+
+type SubmitStrokeRequest struct {
+	X0    float64 `json:"x0"`
+	Y0    float64 `json:"y0"`
+	X1    float64 `json:"x1"`
+	Y1    float64 `json:"y1"`
+	Color string  `json:"color"`
+	Width float64 `json:"width"`
+}
+
+type SubmitStrokeResponse struct {
+	Success bool   `json:"success"`
+	Index   int    `json:"index,omitempty"`
+	Error   string `json:"error,omitempty"`
+}
