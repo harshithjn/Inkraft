@@ -13,10 +13,13 @@ import (
 	"github.com/harshithj/inkraft/replica1/raft"
 )
 
+var gatewayURL string
+
 func main() {
 	replicaID := os.Getenv("REPLICA_ID")
 	port := os.Getenv("PORT")
 	peersEnv := os.Getenv("PEERS")
+	gatewayURL = os.Getenv("GATEWAY_URL")
 
 	var peers []string
 	if peersEnv != "" {
@@ -356,6 +359,22 @@ func main() {
 				fmt.Printf("[%s] committed index=%d (majority ack)\n", raftNode.ID, reqIndex)
 			}
 			raftNode.Mutex.Unlock()
+
+			// Notify gateway of committed stroke
+			if gatewayURL != "" {
+				go func() {
+					notifyBody, _ := json.Marshal(entry)
+					client := &http.Client{Timeout: 1 * time.Second}
+					resp, err := client.Post(gatewayURL+"/notify-gateway", "application/json", bytes.NewBuffer(notifyBody))
+					if err != nil {
+						fmt.Printf("[%s] failed to notify gateway: %v\n", raftNode.ID, err)
+						return
+					}
+					defer resp.Body.Close()
+					fmt.Printf("[%s] notified gateway of commit index=%d\n", raftNode.ID, reqIndex)
+				}()
+			}
+
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(raft.SubmitStrokeResponse{Success: true, Index: reqIndex})
 		} else {
