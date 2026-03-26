@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
@@ -158,13 +157,22 @@ func (lt *LeaderTracker) getLeader() (string, string) {
 	return lt.leaderURL, lt.leaderID
 }
 
+func (lt *LeaderTracker) invalidateLeader() {
+	lt.mu.Lock()
+	defer lt.mu.Unlock()
+	if lt.leaderID != "" {
+		log.Printf("[leader] invalidating leader %s (%s)", lt.leaderID, lt.leaderURL)
+		lt.leaderURL = ""
+		lt.leaderID = ""
+	}
+}
+
 func (lt *LeaderTracker) startPolling() {
 	client := &http.Client{Timeout: 400 * time.Millisecond}
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
-
-	for range ticker.C {
+	
+	for {
 		var foundURL, foundID string
+		tickerDuration := 500 * time.Millisecond
 
 		for _, replica := range lt.replicas {
 			resp, err := client.Get(replica + "/status")
@@ -190,11 +198,16 @@ func (lt *LeaderTracker) startPolling() {
 		oldLeader := lt.leaderID
 		lt.leaderURL = foundURL
 		lt.leaderID = foundID
+		
+		if foundID == "" {
+			// Poll faster if no leader is found
+			tickerDuration = 200 * time.Millisecond
+		}
 		lt.mu.Unlock()
 
 		if foundID != oldLeader {
 			if foundID != "" {
-				log.Printf("[leader] leader changed: %s -> %s (%s)", oldLeader, foundID, foundURL)
+				log.Printf("[leader] leader discovered: %s (%s)", foundID, foundURL)
 				msg, _ := json.Marshal(SystemMessage{
 					Type:   "leader_changed",
 					Leader: foundID,
@@ -209,6 +222,8 @@ func (lt *LeaderTracker) startPolling() {
 				lt.hub.broadcastAll(msg)
 			}
 		}
+
+		time.Sleep(tickerDuration)
 	}
 }
 
@@ -220,25 +235,14 @@ func fetchHistory(lt *LeaderTracker) ([]LogEntry, error) {
 		return nil, fmt.Errorf("no leader available")
 	}
 
-	// Get leader status to know commit index
 	client := &http.Client{Timeout: 2 * time.Second}
-	statusResp, err := client.Get(leaderURL + "/status")
-	if err != nil {
-		return nil, fmt.Errorf("failed to get leader status: %w", err)
-	}
-	var status ReplicaStatus
-	json.NewDecoder(statusResp.Body).Decode(&status)
-	statusResp.Body.Close()
-
-	if status.LogLength == 0 {
-		return []LogEntry{}, nil
-	}
-
+	
 	// Fetch all log entries via /sync-log
 	syncReq := SyncLogRequest{FromIndex: 0}
 	body, _ := json.Marshal(syncReq)
 	resp, err := client.Post(leaderURL+"/sync-log", "application/json", bytes.NewBuffer(body))
 	if err != nil {
+		lt.invalidateLeader()
 		return nil, fmt.Errorf("failed to sync log: %w", err)
 	}
 	defer resp.Body.Close()
@@ -263,7 +267,7 @@ func forwardToLeader(lt *LeaderTracker, stroke StrokeMessage) error {
 		Width: stroke.Width,
 	}
 
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(3 * time.Second)
 	client := &http.Client{Timeout: 1 * time.Second}
 
 	for {
@@ -272,22 +276,28 @@ func forwardToLeader(lt *LeaderTracker, stroke StrokeMessage) error {
 			body, _ := json.Marshal(strokeData)
 			resp, err := client.Post(leaderURL+"/submit-stroke", "application/json", bytes.NewBuffer(body))
 			if err == nil {
-				respBody, _ := io.ReadAll(resp.Body)
-				resp.Body.Close()
+				defer resp.Body.Close()
 				if resp.StatusCode == http.StatusOK {
 					return nil
 				}
-				log.Printf("[forward] leader returned %d: %s", resp.StatusCode, string(respBody))
+				
+				// Decode error to check if not leader
+				var res struct{ Error string }
+				json.NewDecoder(resp.Body).Decode(&res)
+				if res.Error == "not leader" {
+					log.Printf("[forward] %s says not leader, invalidating cache", leaderURL)
+					lt.invalidateLeader()
+				}
 			} else {
-				log.Printf("[forward] error posting to leader %s: %v", leaderURL, err)
+				log.Printf("[forward] error posting to leader %s: %v, invalidating cache", leaderURL, err)
+				lt.invalidateLeader()
 			}
 		}
 
 		if time.Now().After(deadline) {
-			return fmt.Errorf("no leader available after 2s timeout")
+			return fmt.Errorf("no leader available after timeout")
 		}
 
-		log.Printf("[forward] no leader, retrying in 200ms...")
 		time.Sleep(200 * time.Millisecond)
 	}
 }
@@ -326,12 +336,6 @@ func handleWebSocket(hub *Hub, lt *LeaderTracker, w http.ResponseWriter, r *http
 			Leader: leaderID,
 		})
 		client.send <- leaderMsg
-	} else {
-		noLeaderMsg, _ := json.Marshal(SystemMessage{
-			Type:    "no_leader",
-			Message: "Election in progress",
-		})
-		client.send <- noLeaderMsg
 	}
 
 	// Write pump
@@ -354,30 +358,20 @@ func handleWebSocket(hub *Hub, lt *LeaderTracker, w http.ResponseWriter, r *http
 		for {
 			_, message, err := conn.ReadMessage()
 			if err != nil {
-				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
-					log.Printf("[ws] read error: %v", err)
-				}
 				return
 			}
 
 			var incoming IncomingMessage
 			if err := json.Unmarshal(message, &incoming); err != nil {
-				log.Printf("[ws] invalid message: %v", err)
 				continue
 			}
 
 			switch incoming.Type {
 			case "get_history":
-				log.Printf("[ws] client requested history")
 				go func() {
 					entries, err := fetchHistory(lt)
 					if err != nil {
 						log.Printf("[ws] history fetch error: %v", err)
-						errMsg, _ := json.Marshal(HistoryMessage{
-							Type:    "history",
-							Strokes: []StrokeMessage{},
-						})
-						client.send <- errMsg
 						return
 					}
 
@@ -400,7 +394,6 @@ func handleWebSocket(hub *Hub, lt *LeaderTracker, w http.ResponseWriter, r *http
 						Strokes: strokes,
 					})
 					client.send <- histMsg
-					log.Printf("[ws] sent %d history strokes", len(strokes))
 				}()
 
 			case "stroke":
@@ -418,6 +411,11 @@ func handleWebSocket(hub *Hub, lt *LeaderTracker, w http.ResponseWriter, r *http
 
 // ---- Notify Gateway Handler ----
 
+var (
+	lastCommittedIdx = -1
+	commitMu         sync.Mutex
+)
+
 func handleNotifyGateway(hub *Hub) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -430,6 +428,18 @@ func handleNotifyGateway(hub *Hub) http.HandlerFunc {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+
+		commitMu.Lock()
+		if entry.Index <= lastCommittedIdx {
+			commitMu.Unlock()
+			log.Printf("[notify] duplicate stroke index=%d (last=%d), ignoring", entry.Index, lastCommittedIdx)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"ok":true,"duplicate":true}`))
+			return
+		}
+		lastCommittedIdx = entry.Index
+		commitMu.Unlock()
 
 		log.Printf("[notify] committed stroke index=%d", entry.Index)
 
@@ -455,11 +465,6 @@ func handleNotifyGateway(hub *Hub) http.HandlerFunc {
 
 func handleHistory(lt *LeaderTracker) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
 		entries, err := fetchHistory(lt)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)

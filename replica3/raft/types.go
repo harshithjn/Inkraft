@@ -61,7 +61,8 @@ type SyncLogRequest struct {
 }
 
 type SyncLogResponse struct {
-	Entries []LogEntry `json:"entries"`
+	Entries     []LogEntry `json:"entries"`
+	CommitIndex int        `json:"commitIndex"`
 }
 
 type SubmitStrokeRequest struct {

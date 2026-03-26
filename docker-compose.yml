@@ -10,6 +10,7 @@ services:
       context: ./replica1
     container_name: inkraft-replica1
     platform: linux/amd64
+    restart: unless-stopped
     ports:
       - "8001:8001"
     environment:
@@ -21,12 +22,19 @@ services:
       - ./replica1:/app
     networks:
       - inkraft-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
 
   replica2:
     build:
       context: ./replica2
     container_name: inkraft-replica2
     platform: linux/amd64
+    restart: unless-stopped
     ports:
       - "8002:8002"
     environment:
@@ -38,12 +46,19 @@ services:
       - ./replica2:/app
     networks:
       - inkraft-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
 
   replica3:
     build:
       context: ./replica3
     container_name: inkraft-replica3
     platform: linux/amd64
+    restart: unless-stopped
     ports:
       - "8003:8003"
     environment:
@@ -55,12 +70,19 @@ services:
       - ./replica3:/app
     networks:
       - inkraft-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8003/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
 
   gateway:
     build:
       context: ./gateway
     container_name: inkraft-gateway
     platform: linux/amd64
+    restart: unless-stopped
     ports:
       - "9000:9000"
     environment:
@@ -74,3 +96,9 @@ services:
       - replica3
     networks:
       - inkraft-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s

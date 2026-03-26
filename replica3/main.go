@@ -28,6 +28,7 @@ func main() {
 
 	raftNode := raft.NewNode("replica"+replicaID, peers)
 
+	// ---- /status ----
 	http.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		raftNode.Mutex.RLock()
 		status := map[string]interface{}{
@@ -46,6 +47,30 @@ func main() {
 		}
 	})
 
+	// ---- /debug ----
+	http.HandleFunc("/debug", func(w http.ResponseWriter, r *http.Request) {
+		raftNode.Mutex.RLock()
+		lastHB := ""
+		if !raftNode.LastHeartbeat.IsZero() {
+			lastHB = raftNode.LastHeartbeat.Format(time.RFC3339Nano)
+		}
+		debug := map[string]interface{}{
+			"id":            raftNode.ID,
+			"state":         string(raftNode.State),
+			"term":          raftNode.CurrentTerm,
+			"commitIndex":   raftNode.CommitIndex,
+			"logLength":     len(raftNode.Log),
+			"leader":        raftNode.LeaderID,
+			"peers":         raftNode.Peers,
+			"lastHeartbeat": lastHB,
+		}
+		raftNode.Mutex.RUnlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(debug)
+	})
+
+	// ---- /request-vote ----
 	http.HandleFunc("/request-vote", func(w http.ResponseWriter, r *http.Request) {
 		var req raft.VoteRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -94,6 +119,7 @@ func main() {
 		json.NewEncoder(w).Encode(resp)
 	})
 
+	// ---- /heartbeat ----
 	http.HandleFunc("/heartbeat", func(w http.ResponseWriter, r *http.Request) {
 		var req raft.HeartbeatRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -119,7 +145,64 @@ func main() {
 
 		if req.Term >= raftNode.CurrentTerm {
 			raftNode.LeaderID = req.LeaderID
-			fmt.Printf("[%s] received heartbeat from leader=%s term=%d\n", raftNode.ID, req.LeaderID, req.Term)
+			raftNode.LastHeartbeat = time.Now()
+
+			// Advance commitIndex if we have the log, else trigger catch-up
+			if req.LeaderCommit > raftNode.CommitIndex {
+				lastLogIdx := len(raftNode.Log) - 1
+				if req.LeaderCommit <= lastLogIdx {
+					raftNode.CommitIndex = req.LeaderCommit
+					fmt.Printf("[%s] commitIndex advanced to %d via heartbeat\n", raftNode.ID, raftNode.CommitIndex)
+				} else {
+					// Behind! Trigger catch-up
+					go func(leaderID string, logLength int) {
+						var leaderURL string
+						raftNode.Mutex.RLock()
+						for _, p := range raftNode.Peers {
+							if strings.Contains(p, leaderID) {
+								leaderURL = p
+								break
+							}
+						}
+						raftNode.Mutex.RUnlock()
+
+						if leaderURL != "" {
+							syncReq := raft.SyncLogRequest{FromIndex: logLength}
+							body, _ := json.Marshal(syncReq)
+							client := &http.Client{Timeout: 2 * time.Second}
+							resp, err := client.Post(leaderURL+"/sync-log", "application/json", bytes.NewBuffer(body))
+							if err == nil {
+								defer resp.Body.Close()
+								var syncResp raft.SyncLogResponse
+								if json.NewDecoder(resp.Body).Decode(&syncResp) == nil {
+									if len(syncResp.Entries) > 0 {
+										raftNode.Mutex.Lock()
+										// ... (same sync logic as below)
+										for _, entry := range syncResp.Entries {
+											if entry.Index < len(raftNode.Log) {
+												raftNode.Log[entry.Index] = entry
+											} else if entry.Index == len(raftNode.Log) {
+												raftNode.Log = append(raftNode.Log, entry)
+											}
+										}
+										if syncResp.CommitIndex > raftNode.CommitIndex {
+											lastIdx := len(raftNode.Log) - 1
+											if syncResp.CommitIndex <= lastIdx {
+												raftNode.CommitIndex = syncResp.CommitIndex
+											} else if lastIdx >= 0 {
+												raftNode.CommitIndex = lastIdx
+											}
+										}
+										fmt.Printf("[%s] heartbeat catch-up: logLength=%d commitIndex=%d\n", raftNode.ID, len(raftNode.Log), raftNode.CommitIndex)
+										raftNode.Mutex.Unlock()
+									}
+								}
+							}
+						}
+					}(req.LeaderID, len(raftNode.Log))
+				}
+			}
+
 			raftNode.Mutex.Unlock()
 			raftNode.StartElectionTimer()
 			resp.Success = true
@@ -131,6 +214,7 @@ func main() {
 		json.NewEncoder(w).Encode(resp)
 	})
 
+	// ---- /append-entries ----
 	http.HandleFunc("/append-entries", func(w http.ResponseWriter, r *http.Request) {
 		var req raft.AppendEntriesRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -155,11 +239,14 @@ func main() {
 		}
 
 		raftNode.LeaderID = req.LeaderID
+		raftNode.LastHeartbeat = time.Now()
 
+		// Reset election timer (release lock, re-acquire)
 		raftNode.Mutex.Unlock()
 		raftNode.StartElectionTimer()
 		raftNode.Mutex.Lock()
 
+		// Log consistency check
 		if req.PrevLogIndex >= 0 {
 			if req.PrevLogIndex >= len(raftNode.Log) || raftNode.Log[req.PrevLogIndex].Term != req.PrevLogTerm {
 				resp := raft.AppendEntriesResponse{Term: raftNode.CurrentTerm, Success: false, LogLength: len(raftNode.Log)}
@@ -182,7 +269,8 @@ func main() {
 					if leaderURL != "" {
 						syncReq := raft.SyncLogRequest{FromIndex: logLength}
 						body, _ := json.Marshal(syncReq)
-						resp, err := http.Post(leaderURL+"/sync-log", "application/json", bytes.NewBuffer(body))
+						client := &http.Client{Timeout: 2 * time.Second}
+						resp, err := client.Post(leaderURL+"/sync-log", "application/json", bytes.NewBuffer(body))
 						if err == nil {
 							defer resp.Body.Close()
 							var syncResp raft.SyncLogResponse
@@ -196,6 +284,16 @@ func main() {
 											raftNode.Log = append(raftNode.Log, entry)
 										}
 									}
+									// Update commitIndex from sync response
+									if syncResp.CommitIndex > raftNode.CommitIndex {
+										lastIdx := len(raftNode.Log) - 1
+										if syncResp.CommitIndex <= lastIdx {
+											raftNode.CommitIndex = syncResp.CommitIndex
+										} else if lastIdx >= 0 {
+											raftNode.CommitIndex = lastIdx
+										}
+									}
+									fmt.Printf("[%s] sync-log catch-up: logLength=%d commitIndex=%d\n", raftNode.ID, len(raftNode.Log), raftNode.CommitIndex)
 									raftNode.Mutex.Unlock()
 								}
 							}
@@ -206,19 +304,23 @@ func main() {
 			}
 		}
 
+		// Append new entries (idempotent: skip entries already matching)
 		insertIndex := req.PrevLogIndex + 1
 		for i, entry := range req.Entries {
 			logIndex := insertIndex + i
 			if logIndex < len(raftNode.Log) {
 				if raftNode.Log[logIndex].Term != entry.Term {
+					// Conflict: truncate and append
 					raftNode.Log = raftNode.Log[:logIndex]
 					raftNode.Log = append(raftNode.Log, entry)
-					fmt.Printf("[%s] appended entry index=%d term=%d\n", raftNode.ID, entry.Index, entry.Term)
+					fmt.Printf("[%s] resolved conflict, appended entry index=%d term=%d\n", raftNode.ID, entry.Index, entry.Term)
 				}
-			} else {
+				// else: entry already exists with same term — skip (idempotent)
+			} else if logIndex == len(raftNode.Log) {
 				raftNode.Log = append(raftNode.Log, entry)
 				fmt.Printf("[%s] appended entry index=%d term=%d\n", raftNode.ID, entry.Index, entry.Term)
 			}
+			// else: gap — skip (will be filled by sync-log)
 		}
 
 		if req.LeaderCommit > raftNode.CommitIndex {
@@ -229,11 +331,14 @@ func main() {
 				lastNewIndex = raftNode.Log[len(raftNode.Log)-1].Index
 			}
 
-			if req.LeaderCommit < lastNewIndex || lastNewIndex == -1 {
-				raftNode.CommitIndex = req.LeaderCommit
-			} else {
-				raftNode.CommitIndex = lastNewIndex
+			if lastNewIndex >= 0 {
+				if req.LeaderCommit < lastNewIndex {
+					raftNode.CommitIndex = req.LeaderCommit
+				} else {
+					raftNode.CommitIndex = lastNewIndex
+				}
 			}
+			fmt.Printf("[%s] commitIndex updated to %d\n", raftNode.ID, raftNode.CommitIndex)
 		}
 
 		resp := raft.AppendEntriesResponse{Term: raftNode.CurrentTerm, Success: true, LogLength: len(raftNode.Log)}
@@ -242,6 +347,7 @@ func main() {
 		json.NewEncoder(w).Encode(resp)
 	})
 
+	// ---- /sync-log ----
 	http.HandleFunc("/sync-log", func(w http.ResponseWriter, r *http.Request) {
 		var req raft.SyncLogRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -256,14 +362,16 @@ func main() {
 				entries = append(entries, raftNode.Log[i])
 			}
 		}
+		commitIdx := raftNode.CommitIndex
 		raftNode.Mutex.RUnlock()
 
-		fmt.Printf("[%s] sync-log: sending %d entries from index %d\n", raftNode.ID, len(entries), req.FromIndex)
+		fmt.Printf("[%s] sync-log: sending %d entries from index %d, commitIndex=%d\n", raftNode.ID, len(entries), req.FromIndex, commitIdx)
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(raft.SyncLogResponse{Entries: entries})
+		json.NewEncoder(w).Encode(raft.SyncLogResponse{Entries: entries, CommitIndex: commitIdx})
 	})
 
+	// ---- /submit-stroke ----
 	http.HandleFunc("/submit-stroke", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -321,7 +429,7 @@ func main() {
 			wg.Add(1)
 			go func(p string) {
 				defer wg.Done()
-				client := &http.Client{Timeout: 300 * time.Millisecond}
+				client := &http.Client{Timeout: 500 * time.Millisecond}
 				resp, err := client.Post(p+"/append-entries", "application/json", bytes.NewBuffer(reqBody))
 				if err == nil {
 					defer resp.Body.Close()
@@ -345,18 +453,19 @@ func main() {
 
 		select {
 		case <-done:
-		case <-time.After(300 * time.Millisecond):
+		case <-time.After(500 * time.Millisecond):
 		}
 
 		ackMutex.Lock()
 		acks := successAcks
 		ackMutex.Unlock()
 
-		if acks >= (len(peers)+1)/2+1 {
+		quorum := (len(peers)+1)/2 + 1
+		if acks >= quorum {
 			raftNode.Mutex.Lock()
 			if reqIndex > raftNode.CommitIndex {
 				raftNode.CommitIndex = reqIndex
-				fmt.Printf("[%s] committed index=%d (majority ack)\n", raftNode.ID, reqIndex)
+				fmt.Printf("[%s] committed index=%d term=%d (majority ack=%d)\n", raftNode.ID, reqIndex, reqTerm, acks)
 			}
 			raftNode.Mutex.Unlock()
 
@@ -364,20 +473,25 @@ func main() {
 			if gatewayURL != "" {
 				go func() {
 					notifyBody, _ := json.Marshal(entry)
-					client := &http.Client{Timeout: 1 * time.Second}
-					resp, err := client.Post(gatewayURL+"/notify-gateway", "application/json", bytes.NewBuffer(notifyBody))
-					if err != nil {
-						fmt.Printf("[%s] failed to notify gateway: %v\n", raftNode.ID, err)
+					client := &http.Client{Timeout: 2 * time.Second}
+					for attempt := 0; attempt < 3; attempt++ {
+						resp, err := client.Post(gatewayURL+"/notify-gateway", "application/json", bytes.NewBuffer(notifyBody))
+						if err != nil {
+							fmt.Printf("[%s] failed to notify gateway (attempt %d): %v\n", raftNode.ID, attempt+1, err)
+							time.Sleep(200 * time.Millisecond)
+							continue
+						}
+						resp.Body.Close()
+						fmt.Printf("[%s] notified gateway of commit index=%d\n", raftNode.ID, reqIndex)
 						return
 					}
-					defer resp.Body.Close()
-					fmt.Printf("[%s] notified gateway of commit index=%d\n", raftNode.ID, reqIndex)
 				}()
 			}
 
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(raft.SubmitStrokeResponse{Success: true, Index: reqIndex})
 		} else {
+			fmt.Printf("[%s] failed to commit index=%d: acks=%d quorum=%d\n", raftNode.ID, reqIndex, acks, quorum)
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(raft.SubmitStrokeResponse{Success: false, Error: "failed to get majority ack"})
 		}

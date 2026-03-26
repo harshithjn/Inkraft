@@ -24,6 +24,7 @@ type Node struct {
 	Mutex           sync.RWMutex
 	ElectionTimer   *time.Timer
 	HeartbeatTicker *time.Ticker
+	LastHeartbeat   time.Time
 }
 
 func NewNode(id string, peers []string) *Node {
@@ -33,7 +34,7 @@ func NewNode(id string, peers []string) *Node {
 		CurrentTerm: 0,
 		VotedFor:    "",
 		Log:         make([]LogEntry, 0),
-		CommitIndex: 0,
+		CommitIndex: -1,
 		Peers:       peers,
 		LeaderID:    "",
 	}
@@ -44,10 +45,15 @@ func (n *Node) Start() {
 	n.StartElectionTimer()
 }
 
+// StartElectionTimer acquires the mutex – use from outside lock context only.
 func (n *Node) StartElectionTimer() {
 	n.Mutex.Lock()
 	defer n.Mutex.Unlock()
+	n.resetElectionTimerLocked()
+}
 
+// resetElectionTimerLocked resets the election timer. Caller MUST hold Mutex.
+func (n *Node) resetElectionTimerLocked() {
 	if n.ElectionTimer != nil {
 		n.ElectionTimer.Stop()
 	}
@@ -70,19 +76,12 @@ func (n *Node) BecomeFollower(term int) {
 
 	if n.HeartbeatTicker != nil {
 		n.HeartbeatTicker.Stop()
+		n.HeartbeatTicker = nil
 	}
 
-	fmt.Printf("[%s] %s->FOLLOWER term=%d\n", n.ID, oldState, n.CurrentTerm)
-	
-	// Reset election timer
-	if n.ElectionTimer != nil {
-		n.ElectionTimer.Stop()
-	}
-	r := rand.New(rand.NewSource(time.Now().UnixNano()))
-	timeout := time.Duration(500+r.Intn(300)) * time.Millisecond
-	n.ElectionTimer = time.AfterFunc(timeout, func() {
-		n.BecomeCandidate()
-	})
+	fmt.Printf("[%s] %s->FOLLOWER term=%d commitIndex=%d\n", n.ID, oldState, n.CurrentTerm, n.CommitIndex)
+
+	n.resetElectionTimerLocked()
 }
 
 func (n *Node) BecomeCandidate() {
@@ -94,23 +93,15 @@ func (n *Node) BecomeCandidate() {
 	n.CurrentTerm++
 	n.VotedFor = n.ID
 
-	fmt.Printf("[%s] %s->CANDIDATE term=%d\n", n.ID, oldState, n.CurrentTerm)
+	fmt.Printf("[%s] %s->CANDIDATE term=%d commitIndex=%d\n", n.ID, oldState, n.CurrentTerm, n.CommitIndex)
 
 	// Reset election timer for split vote retry
-	if n.ElectionTimer != nil {
-		n.ElectionTimer.Stop()
-	}
-	r := rand.New(rand.NewSource(time.Now().UnixNano()))
-	timeout := time.Duration(500+r.Intn(300)) * time.Millisecond
-	fmt.Printf("[%s] Election timer reset for %v (candidate retry)\n", n.ID, timeout)
-	n.ElectionTimer = time.AfterFunc(timeout, func() {
-		n.BecomeCandidate()
-	})
+	n.resetElectionTimerLocked()
 
-	go n.StartElection()
+	go n.startElectionUnlocked()
 }
 
-func (n *Node) StartElection() {
+func (n *Node) startElectionUnlocked() {
 	n.Mutex.RLock()
 	if n.State != Candidate {
 		n.Mutex.RUnlock()
@@ -120,6 +111,13 @@ func (n *Node) StartElection() {
 	id := n.ID
 	peers := make([]string, len(n.Peers))
 	copy(peers, n.Peers)
+
+	lastLogIndex := -1
+	lastLogTerm := 0
+	if len(n.Log) > 0 {
+		lastLogIndex = n.Log[len(n.Log)-1].Index
+		lastLogTerm = n.Log[len(n.Log)-1].Term
+	}
 	n.Mutex.RUnlock()
 
 	votes := 1 // Vote for self
@@ -135,8 +133,10 @@ func (n *Node) StartElection() {
 		go func(peer string) {
 			defer wg.Done()
 			req := VoteRequest{
-				Term:        term,
-				CandidateID: id,
+				Term:         term,
+				CandidateID:  id,
+				LastLogIndex: lastLogIndex,
+				LastLogTerm:  lastLogTerm,
 			}
 			body, _ := json.Marshal(req)
 			resp, err := client.Post(peer+"/request-vote", "application/json", bytes.NewBuffer(body))
@@ -183,7 +183,7 @@ func (n *Node) StartElection() {
 
 	n.Mutex.Lock()
 	if n.State == Candidate && n.CurrentTerm == term && votes >= (len(n.Peers)+1)/2+1 {
-		fmt.Printf("[%s] CANDIDATE->LEADER term=%d votes=%d\n", n.ID, n.CurrentTerm, votes)
+		fmt.Printf("[%s] CANDIDATE->LEADER term=%d votes=%d commitIndex=%d\n", n.ID, n.CurrentTerm, votes, n.CommitIndex)
 		n.Mutex.Unlock()
 		n.BecomeLeader()
 	} else {
@@ -199,6 +199,7 @@ func (n *Node) SendHeartbeats() {
 	}
 	term := n.CurrentTerm
 	id := n.ID
+	commitIndex := n.CommitIndex
 	peers := make([]string, len(n.Peers))
 	copy(peers, n.Peers)
 	n.Mutex.RUnlock()
@@ -208,13 +209,13 @@ func (n *Node) SendHeartbeats() {
 	for _, peer := range peers {
 		go func(peer string) {
 			req := HeartbeatRequest{
-				Term:     term,
-				LeaderID: id,
+				Term:         term,
+				LeaderID:     id,
+				LeaderCommit: commitIndex,
 			}
 			body, _ := json.Marshal(req)
 			resp, err := client.Post(peer+"/heartbeat", "application/json", bytes.NewBuffer(body))
 			if err != nil {
-				// Heartbeat failure is common, don't spam too much or log at low frequency
 				return
 			}
 			defer resp.Body.Close()
@@ -240,15 +241,15 @@ func (n *Node) BecomeLeader() {
 		return
 	}
 
-	oldState := n.State
 	n.State = Leader
 	n.LeaderID = n.ID
 
 	if n.ElectionTimer != nil {
 		n.ElectionTimer.Stop()
+		n.ElectionTimer = nil
 	}
 
-	fmt.Printf("[%s] %s->LEADER term=%d\n", n.ID, oldState, n.CurrentTerm)
+	fmt.Printf("[%s] BECAME LEADER term=%d commitIndex=%d logLength=%d\n", n.ID, n.CurrentTerm, n.CommitIndex, len(n.Log))
 
 	n.HeartbeatTicker = time.NewTicker(150 * time.Millisecond)
 	go func() {
