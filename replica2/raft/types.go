@@ -20,7 +20,8 @@ type StrokeData struct {
 type LogEntry struct {
 	Index  int        `json:"index"`
 	Term   int        `json:"term"`
-	Stroke StrokeData `json:"stroke"`
+	Type   string     `json:"type"` // "stroke" or "clear"
+	Stroke StrokeData `json:"stroke,omitempty"`
 }
 
 type VoteRequest struct {

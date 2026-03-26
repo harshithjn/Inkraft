@@ -254,7 +254,9 @@
     });
 
     clearBtn.addEventListener("click", () => {
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: "clear" }));
+        }
     });
 
     function drawLine(x0, y0, x1, y1, color, width) {
@@ -271,9 +273,15 @@
     function replayHistory(strokes) {
         ctx.clearRect(0, 0, canvas.width, canvas.height);
         renderedIndices.clear();
-        strokeHistory = strokes;
+        strokeHistory = [];
         for (const s of strokes) {
+            if (s.type === "clear") {
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                strokeHistory = [];
+                continue;
+            }
             drawLine(s.x0, s.y0, s.x1, s.y1, s.color, s.width);
+            strokeHistory.push(s);
             if (s.index !== undefined) renderedIndices.add(s.index);
         }
     }
@@ -310,8 +318,12 @@
     }
 
     function connect() {
+        // Automatically detect if we are on Vercel (production) or local
+        const isVercel = window.location.hostname.includes("vercel") || window.location.hostname.includes("inkraft");
+        const backendHost = isVercel ? "inkraft.harshithj.me" : window.location.host;
+        
         const proto = location.protocol === "https:" ? "wss:" : "ws:";
-        ws = new WebSocket(proto + "//" + location.host + "/ws");
+        ws = new WebSocket(proto + "//" + backendHost + "/ws");
 
         ws.onopen = () => {
             document.getElementById("overlay").classList.remove("visible");
@@ -340,8 +352,14 @@
                     drawLine(msg.x0, msg.y0, msg.x1, msg.y1, msg.color, msg.width);
                     strokeHistory.push(msg);
                     break;
+                case "clear":
+                    if (msg.index !== undefined && renderedIndices.has(msg.index)) break;
+                    if (msg.index !== undefined) renderedIndices.add(msg.index);
+                    ctx.clearRect(0, 0, canvas.width, canvas.height);
+                    strokeHistory = [];
+                    break;
                 case "history":
-                    if (msg.strokes && msg.strokes.length > 0) replayHistory(msg.strokes);
+                    if (msg.strokes) replayHistory(msg.strokes);
                     break;
             }
         };

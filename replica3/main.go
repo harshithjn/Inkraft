@@ -15,6 +15,118 @@ import (
 
 var gatewayURL string
 
+func handleSubmission(w http.ResponseWriter, raftNode *raft.Node, entry raft.LogEntry) {
+	raftNode.Mutex.Lock()
+	if raftNode.State != raft.Leader {
+		raftNode.Mutex.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(raft.SubmitStrokeResponse{Success: false, Error: "not leader"})
+		return
+	}
+
+	entry.Index = len(raftNode.Log)
+	entry.Term = raftNode.CurrentTerm
+	raftNode.Log = append(raftNode.Log, entry)
+	
+	reqIndex := entry.Index
+	reqTerm := entry.Term
+	peers := raftNode.Peers
+	leaderID := raftNode.ID
+	commitIndex := raftNode.CommitIndex
+	prevLogIndex := reqIndex - 1
+	prevLogTerm := 0
+	if prevLogIndex >= 0 && prevLogIndex < len(raftNode.Log) {
+		prevLogTerm = raftNode.Log[prevLogIndex].Term
+	}
+	raftNode.Mutex.Unlock()
+
+	appendReq := raft.AppendEntriesRequest{
+		Term:         reqTerm,
+		LeaderID:     leaderID,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  prevLogTerm,
+		Entries:      []raft.LogEntry{entry},
+		LeaderCommit: commitIndex,
+	}
+
+	reqBody, _ := json.Marshal(appendReq)
+	
+	var wg sync.WaitGroup
+	successAcks := 1 // self ack
+	var ackMutex sync.Mutex
+
+	for _, peer := range peers {
+		wg.Add(1)
+		go func(p string) {
+			defer wg.Done()
+			client := &http.Client{Timeout: 500 * time.Millisecond}
+			resp, err := client.Post(p+"/append-entries", "application/json", bytes.NewBuffer(reqBody))
+			if err == nil {
+				defer resp.Body.Close()
+				var appResp raft.AppendEntriesResponse
+				if json.NewDecoder(resp.Body).Decode(&appResp) == nil {
+					if appResp.Success {
+						ackMutex.Lock()
+						successAcks++
+						ackMutex.Unlock()
+					}
+				}
+			}
+		}(peer)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+	}
+
+	ackMutex.Lock()
+	acks := successAcks
+	ackMutex.Unlock()
+
+	quorum := (len(peers)+1)/2 + 1
+	if acks >= quorum {
+		raftNode.Mutex.Lock()
+		if reqIndex > raftNode.CommitIndex {
+			raftNode.CommitIndex = reqIndex
+			fmt.Printf("[%s] committed index=%d term=%d (majority ack=%d)\n", raftNode.ID, reqIndex, reqTerm, acks)
+		}
+		raftNode.Mutex.Unlock()
+
+		// Notify gateway
+		if gatewayURL != "" {
+			go func() {
+				notifyBody, _ := json.Marshal(entry)
+				client := &http.Client{Timeout: 2 * time.Second}
+				for attempt := 0; attempt < 3; attempt++ {
+					resp, err := client.Post(gatewayURL+"/notify-gateway", "application/json", bytes.NewBuffer(notifyBody))
+					if err != nil {
+						fmt.Printf("[%s] failed to notify gateway (attempt %d): %v\n", raftNode.ID, attempt+1, err)
+						time.Sleep(200 * time.Millisecond)
+						continue
+					}
+					resp.Body.Close()
+					fmt.Printf("[%s] notified gateway of commit index=%d type=%s\n", raftNode.ID, reqIndex, entry.Type)
+					return
+				}
+			}()
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(raft.SubmitStrokeResponse{Success: true, Index: reqIndex})
+	} else {
+		fmt.Printf("[%s] failed to commit index=%d: acks=%d quorum=%d\n", raftNode.ID, reqIndex, acks, quorum)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(raft.SubmitStrokeResponse{Success: false, Error: "failed to get majority ack"})
+	}
+}
+
 func main() {
 	replicaID := os.Getenv("REPLICA_ID")
 	port := os.Getenv("PORT")
@@ -384,117 +496,24 @@ func main() {
 			return
 		}
 
-		raftNode.Mutex.Lock()
-		if raftNode.State != raft.Leader {
-			raftNode.Mutex.Unlock()
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(raft.SubmitStrokeResponse{Success: false, Error: "not leader"})
+		entry := raft.LogEntry{
+			Type:   "stroke",
+			Stroke: stroke,
+		}
+		handleSubmission(w, raftNode, entry)
+	})
+
+	// ---- /submit-clear ----
+	http.HandleFunc("/submit-clear", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 
 		entry := raft.LogEntry{
-			Index:  len(raftNode.Log),
-			Term:   raftNode.CurrentTerm,
-			Stroke: stroke,
+			Type: "clear",
 		}
-		raftNode.Log = append(raftNode.Log, entry)
-		reqIndex := entry.Index
-		reqTerm := entry.Term
-		peers := raftNode.Peers
-		leaderID := raftNode.ID
-		commitIndex := raftNode.CommitIndex
-		prevLogIndex := reqIndex - 1
-		prevLogTerm := 0
-		if prevLogIndex >= 0 && prevLogIndex < len(raftNode.Log) {
-			prevLogTerm = raftNode.Log[prevLogIndex].Term
-		}
-		raftNode.Mutex.Unlock()
-
-		appendReq := raft.AppendEntriesRequest{
-			Term:         reqTerm,
-			LeaderID:     leaderID,
-			PrevLogIndex: prevLogIndex,
-			PrevLogTerm:  prevLogTerm,
-			Entries:      []raft.LogEntry{entry},
-			LeaderCommit: commitIndex,
-		}
-
-		reqBody, _ := json.Marshal(appendReq)
-		
-		var wg sync.WaitGroup
-		successAcks := 1 // self ack
-		var ackMutex sync.Mutex
-
-		for _, peer := range peers {
-			wg.Add(1)
-			go func(p string) {
-				defer wg.Done()
-				client := &http.Client{Timeout: 500 * time.Millisecond}
-				resp, err := client.Post(p+"/append-entries", "application/json", bytes.NewBuffer(reqBody))
-				if err == nil {
-					defer resp.Body.Close()
-					var appResp raft.AppendEntriesResponse
-					if json.NewDecoder(resp.Body).Decode(&appResp) == nil {
-						if appResp.Success {
-							ackMutex.Lock()
-							successAcks++
-							ackMutex.Unlock()
-						}
-					}
-				}
-			}(peer)
-		}
-
-		done := make(chan struct{})
-		go func() {
-			wg.Wait()
-			close(done)
-		}()
-
-		select {
-		case <-done:
-		case <-time.After(500 * time.Millisecond):
-		}
-
-		ackMutex.Lock()
-		acks := successAcks
-		ackMutex.Unlock()
-
-		quorum := (len(peers)+1)/2 + 1
-		if acks >= quorum {
-			raftNode.Mutex.Lock()
-			if reqIndex > raftNode.CommitIndex {
-				raftNode.CommitIndex = reqIndex
-				fmt.Printf("[%s] committed index=%d term=%d (majority ack=%d)\n", raftNode.ID, reqIndex, reqTerm, acks)
-			}
-			raftNode.Mutex.Unlock()
-
-			// Notify gateway of committed stroke
-			if gatewayURL != "" {
-				go func() {
-					notifyBody, _ := json.Marshal(entry)
-					client := &http.Client{Timeout: 2 * time.Second}
-					for attempt := 0; attempt < 3; attempt++ {
-						resp, err := client.Post(gatewayURL+"/notify-gateway", "application/json", bytes.NewBuffer(notifyBody))
-						if err != nil {
-							fmt.Printf("[%s] failed to notify gateway (attempt %d): %v\n", raftNode.ID, attempt+1, err)
-							time.Sleep(200 * time.Millisecond)
-							continue
-						}
-						resp.Body.Close()
-						fmt.Printf("[%s] notified gateway of commit index=%d\n", raftNode.ID, reqIndex)
-						return
-					}
-				}()
-			}
-
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(raft.SubmitStrokeResponse{Success: true, Index: reqIndex})
-		} else {
-			fmt.Printf("[%s] failed to commit index=%d: acks=%d quorum=%d\n", raftNode.ID, reqIndex, acks, quorum)
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(raft.SubmitStrokeResponse{Success: false, Error: "failed to get majority ack"})
-		}
+		handleSubmission(w, raftNode, entry)
 	})
 
 	raftNode.Start()

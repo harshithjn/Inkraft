@@ -18,12 +18,12 @@ import (
 
 type StrokeMessage struct {
 	Type  string  `json:"type"`
-	X0    float64 `json:"x0"`
-	Y0    float64 `json:"y0"`
-	X1    float64 `json:"x1"`
-	Y1    float64 `json:"y1"`
-	Color string  `json:"color"`
-	Width float64 `json:"width"`
+	X0    float64 `json:"x0,omitempty"`
+	Y0    float64 `json:"y0,omitempty"`
+	X1    float64 `json:"x1,omitempty"`
+	Y1    float64 `json:"y1,omitempty"`
+	Color string  `json:"color,omitempty"`
+	Width float64 `json:"width,omitempty"`
 	Index int     `json:"index,omitempty"`
 }
 
@@ -45,7 +45,8 @@ type IncomingMessage struct {
 type LogEntry struct {
 	Index  int        `json:"index"`
 	Term   int        `json:"term"`
-	Stroke StrokeData `json:"stroke"`
+	Type   string     `json:"type"` // "stroke" or "clear"
+	Stroke StrokeData `json:"stroke,omitempty"`
 }
 
 type StrokeData struct {
@@ -258,13 +259,23 @@ func fetchHistory(lt *LeaderTracker) ([]LogEntry, error) {
 // ---- Stroke Forwarding ----
 
 func forwardToLeader(lt *LeaderTracker, stroke StrokeMessage) error {
-	strokeData := StrokeData{
-		X0:    stroke.X0,
-		Y0:    stroke.Y0,
-		X1:    stroke.X1,
-		Y1:    stroke.Y1,
-		Color: stroke.Color,
-		Width: stroke.Width,
+	var body []byte
+	var endpoint string
+
+	if stroke.Type == "clear" {
+		endpoint = "/submit-clear"
+		body, _ = json.Marshal(map[string]interface{}{})
+	} else {
+		endpoint = "/submit-stroke"
+		strokeData := StrokeData{
+			X0:    stroke.X0,
+			Y0:    stroke.Y0,
+			X1:    stroke.X1,
+			Y1:    stroke.Y1,
+			Color: stroke.Color,
+			Width: stroke.Width,
+		}
+		body, _ = json.Marshal(strokeData)
 	}
 
 	deadline := time.Now().Add(3 * time.Second)
@@ -273,8 +284,7 @@ func forwardToLeader(lt *LeaderTracker, stroke StrokeMessage) error {
 	for {
 		leaderURL, _ := lt.getLeader()
 		if leaderURL != "" {
-			body, _ := json.Marshal(strokeData)
-			resp, err := client.Post(leaderURL+"/submit-stroke", "application/json", bytes.NewBuffer(body))
+			resp, err := client.Post(leaderURL+endpoint, "application/json", bytes.NewBuffer(body))
 			if err == nil {
 				defer resp.Body.Close()
 				if resp.StatusCode == http.StatusOK {
@@ -378,7 +388,7 @@ func handleWebSocket(hub *Hub, lt *LeaderTracker, w http.ResponseWriter, r *http
 					strokes := make([]StrokeMessage, len(entries))
 					for i, e := range entries {
 						strokes[i] = StrokeMessage{
-							Type:  "stroke",
+							Type:  e.Type,
 							X0:    e.Stroke.X0,
 							Y0:    e.Stroke.Y0,
 							X1:    e.Stroke.X1,
@@ -396,9 +406,10 @@ func handleWebSocket(hub *Hub, lt *LeaderTracker, w http.ResponseWriter, r *http
 					client.send <- histMsg
 				}()
 
-			case "stroke":
+			case "stroke", "clear":
 				var stroke StrokeMessage
 				json.Unmarshal(message, &stroke)
+				stroke.Type = incoming.Type
 				go func() {
 					if err := forwardToLeader(lt, stroke); err != nil {
 						log.Printf("[ws] forward error: %v", err)
@@ -441,10 +452,10 @@ func handleNotifyGateway(hub *Hub) http.HandlerFunc {
 		lastCommittedIdx = entry.Index
 		commitMu.Unlock()
 
-		log.Printf("[notify] committed stroke index=%d", entry.Index)
+		log.Printf("[notify] committed %s index=%d", entry.Type, entry.Index)
 
 		msg, _ := json.Marshal(StrokeMessage{
-			Type:  "stroke",
+			Type:  entry.Type,
 			X0:    entry.Stroke.X0,
 			Y0:    entry.Stroke.Y0,
 			X1:    entry.Stroke.X1,
