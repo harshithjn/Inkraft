@@ -34,6 +34,15 @@ type SystemMessage struct {
 	Leader  string `json:"leader,omitempty"`
 }
 
+type HistoryMessage struct {
+	Type    string          `json:"type"`
+	Strokes []StrokeMessage `json:"strokes"`
+}
+
+type IncomingMessage struct {
+	Type string `json:"type"`
+}
+
 type LogEntry struct {
 	Index  int        `json:"index"`
 	Term   int        `json:"term"`
@@ -50,8 +59,18 @@ type StrokeData struct {
 }
 
 type ReplicaStatus struct {
-	ID    string `json:"id"`
-	State string `json:"state"`
+	ID          string `json:"id"`
+	State       string `json:"state"`
+	CommitIndex int    `json:"commitIndex"`
+	LogLength   int    `json:"logLength"`
+}
+
+type SyncLogRequest struct {
+	FromIndex int `json:"fromIndex"`
+}
+
+type SyncLogResponse struct {
+	Entries []LogEntry `json:"entries"`
 }
 
 // ---- WebSocket Hub ----
@@ -102,7 +121,6 @@ func (h *Hub) run() {
 				select {
 				case client.send <- msg:
 				default:
-					// Client send buffer full, drop it
 					go func(c *Client) {
 						h.unregister <- c
 					}(client)
@@ -174,48 +192,91 @@ func (lt *LeaderTracker) startPolling() {
 		lt.leaderID = foundID
 		lt.mu.Unlock()
 
-		if foundID != "" && foundID != oldLeader {
-			log.Printf("[leader] leader changed: %s -> %s (%s)", oldLeader, foundID, foundURL)
-			msg, _ := json.Marshal(SystemMessage{
-				Type:   "leader_changed",
-				Leader: foundID,
-			})
-			lt.hub.broadcastAll(msg)
+		if foundID != oldLeader {
+			if foundID != "" {
+				log.Printf("[leader] leader changed: %s -> %s (%s)", oldLeader, foundID, foundURL)
+				msg, _ := json.Marshal(SystemMessage{
+					Type:   "leader_changed",
+					Leader: foundID,
+				})
+				lt.hub.broadcastAll(msg)
+			} else if oldLeader != "" {
+				log.Printf("[leader] leader lost (was %s)", oldLeader)
+				msg, _ := json.Marshal(SystemMessage{
+					Type:    "no_leader",
+					Message: "Election in progress",
+				})
+				lt.hub.broadcastAll(msg)
+			}
 		}
 	}
+}
+
+// ---- History Fetching ----
+
+func fetchHistory(lt *LeaderTracker) ([]LogEntry, error) {
+	leaderURL, _ := lt.getLeader()
+	if leaderURL == "" {
+		return nil, fmt.Errorf("no leader available")
+	}
+
+	// Get leader status to know commit index
+	client := &http.Client{Timeout: 2 * time.Second}
+	statusResp, err := client.Get(leaderURL + "/status")
+	if err != nil {
+		return nil, fmt.Errorf("failed to get leader status: %w", err)
+	}
+	var status ReplicaStatus
+	json.NewDecoder(statusResp.Body).Decode(&status)
+	statusResp.Body.Close()
+
+	if status.LogLength == 0 {
+		return []LogEntry{}, nil
+	}
+
+	// Fetch all log entries via /sync-log
+	syncReq := SyncLogRequest{FromIndex: 0}
+	body, _ := json.Marshal(syncReq)
+	resp, err := client.Post(leaderURL+"/sync-log", "application/json", bytes.NewBuffer(body))
+	if err != nil {
+		return nil, fmt.Errorf("failed to sync log: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var syncResp SyncLogResponse
+	if err := json.NewDecoder(resp.Body).Decode(&syncResp); err != nil {
+		return nil, fmt.Errorf("failed to decode sync response: %w", err)
+	}
+
+	return syncResp.Entries, nil
 }
 
 // ---- Stroke Forwarding ----
 
 func forwardToLeader(lt *LeaderTracker, stroke StrokeMessage) error {
-	body, err := json.Marshal(StrokeData{
+	strokeData := StrokeData{
 		X0:    stroke.X0,
 		Y0:    stroke.Y0,
 		X1:    stroke.X1,
 		Y1:    stroke.Y1,
 		Color: stroke.Color,
 		Width: stroke.Width,
-	})
-	if err != nil {
-		return fmt.Errorf("marshal error: %w", err)
 	}
 
-	// Try for up to 2 seconds to find a leader
 	deadline := time.Now().Add(2 * time.Second)
 	client := &http.Client{Timeout: 1 * time.Second}
 
 	for {
 		leaderURL, _ := lt.getLeader()
 		if leaderURL != "" {
+			body, _ := json.Marshal(strokeData)
 			resp, err := client.Post(leaderURL+"/submit-stroke", "application/json", bytes.NewBuffer(body))
 			if err == nil {
-				defer resp.Body.Close()
+				respBody, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
 				if resp.StatusCode == http.StatusOK {
-					// Read and discard body
-					io.Copy(io.Discard, resp.Body)
 					return nil
 				}
-				respBody, _ := io.ReadAll(resp.Body)
 				log.Printf("[forward] leader returned %d: %s", resp.StatusCode, string(respBody))
 			} else {
 				log.Printf("[forward] error posting to leader %s: %v", leaderURL, err)
@@ -257,7 +318,7 @@ func handleWebSocket(hub *Hub, lt *LeaderTracker, w http.ResponseWriter, r *http
 	})
 	client.send <- connMsg
 
-	// Send current leader info if available
+	// Send current leader info
 	_, leaderID := lt.getLeader()
 	if leaderID != "" {
 		leaderMsg, _ := json.Marshal(SystemMessage{
@@ -265,13 +326,17 @@ func handleWebSocket(hub *Hub, lt *LeaderTracker, w http.ResponseWriter, r *http
 			Leader: leaderID,
 		})
 		client.send <- leaderMsg
+	} else {
+		noLeaderMsg, _ := json.Marshal(SystemMessage{
+			Type:    "no_leader",
+			Message: "Election in progress",
+		})
+		client.send <- noLeaderMsg
 	}
 
 	// Write pump
 	go func() {
-		defer func() {
-			conn.Close()
-		}()
+		defer conn.Close()
 		for msg := range client.send {
 			if err := conn.WriteMessage(websocket.TextMessage, msg); err != nil {
 				return
@@ -295,22 +360,58 @@ func handleWebSocket(hub *Hub, lt *LeaderTracker, w http.ResponseWriter, r *http
 				return
 			}
 
-			var stroke StrokeMessage
-			if err := json.Unmarshal(message, &stroke); err != nil {
+			var incoming IncomingMessage
+			if err := json.Unmarshal(message, &incoming); err != nil {
 				log.Printf("[ws] invalid message: %v", err)
 				continue
 			}
 
-			if stroke.Type != "stroke" {
-				continue
-			}
+			switch incoming.Type {
+			case "get_history":
+				log.Printf("[ws] client requested history")
+				go func() {
+					entries, err := fetchHistory(lt)
+					if err != nil {
+						log.Printf("[ws] history fetch error: %v", err)
+						errMsg, _ := json.Marshal(HistoryMessage{
+							Type:    "history",
+							Strokes: []StrokeMessage{},
+						})
+						client.send <- errMsg
+						return
+					}
 
-			// Forward to leader asynchronously
-			go func() {
-				if err := forwardToLeader(lt, stroke); err != nil {
-					log.Printf("[ws] forward error: %v", err)
-				}
-			}()
+					strokes := make([]StrokeMessage, len(entries))
+					for i, e := range entries {
+						strokes[i] = StrokeMessage{
+							Type:  "stroke",
+							X0:    e.Stroke.X0,
+							Y0:    e.Stroke.Y0,
+							X1:    e.Stroke.X1,
+							Y1:    e.Stroke.Y1,
+							Color: e.Stroke.Color,
+							Width: e.Stroke.Width,
+							Index: e.Index,
+						}
+					}
+
+					histMsg, _ := json.Marshal(HistoryMessage{
+						Type:    "history",
+						Strokes: strokes,
+					})
+					client.send <- histMsg
+					log.Printf("[ws] sent %d history strokes", len(strokes))
+				}()
+
+			case "stroke":
+				var stroke StrokeMessage
+				json.Unmarshal(message, &stroke)
+				go func() {
+					if err := forwardToLeader(lt, stroke); err != nil {
+						log.Printf("[ws] forward error: %v", err)
+					}
+				}()
+			}
 		}
 	}()
 }
@@ -332,7 +433,6 @@ func handleNotifyGateway(hub *Hub) http.HandlerFunc {
 
 		log.Printf("[notify] committed stroke index=%d", entry.Index)
 
-		// Broadcast to all WebSocket clients
 		msg, _ := json.Marshal(StrokeMessage{
 			Type:  "stroke",
 			X0:    entry.Stroke.X0,
@@ -345,8 +445,46 @@ func handleNotifyGateway(hub *Hub) http.HandlerFunc {
 		})
 		hub.broadcastAll(msg)
 
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"ok":true}`))
+	}
+}
+
+// ---- History HTTP Handler ----
+
+func handleHistory(lt *LeaderTracker) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		entries, err := fetchHistory(lt)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+
+		strokes := make([]StrokeMessage, len(entries))
+		for i, e := range entries {
+			strokes[i] = StrokeMessage{
+				Type:  "stroke",
+				X0:    e.Stroke.X0,
+				Y0:    e.Stroke.Y0,
+				X1:    e.Stroke.X1,
+				Y1:    e.Stroke.Y1,
+				Color: e.Stroke.Color,
+				Width: e.Stroke.Width,
+				Index: e.Index,
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(HistoryMessage{
+			Type:    "history",
+			Strokes: strokes,
+		})
 	}
 }
 
@@ -385,6 +523,9 @@ func main() {
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
+
+	// History endpoint
+	http.HandleFunc("/history", handleHistory(lt))
 
 	// Notify gateway (called by leader after commit)
 	http.HandleFunc("/notify-gateway", handleNotifyGateway(hub))

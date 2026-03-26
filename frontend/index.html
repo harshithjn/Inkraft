@@ -3,277 +3,329 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Inkraft — Distributed Drawing Board</title>
+    <title>Inkraft</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
+
         body {
-            font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
-            background: #1a1a2e;
-            color: #e0e0e0;
+            font-family: -apple-system, 'Segoe UI', system-ui, sans-serif;
+            background: #f5f5f5;
+            color: #333;
             display: flex;
             flex-direction: column;
-            align-items: center;
-            min-height: 100vh;
+            height: 100vh;
+            overflow: hidden;
+            user-select: none;
         }
-        header {
-            width: 100%;
-            padding: 16px 24px;
-            background: #16213e;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.3);
-        }
-        header h1 {
-            font-size: 1.4rem;
-            font-weight: 700;
-            background: linear-gradient(135deg, #e94560, #0f3460);
-            -webkit-background-clip: text;
-            background-clip: text;
-            -webkit-text-fill-color: transparent;
-        }
-        .status {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            font-size: 0.85rem;
-        }
-        .status-dot {
-            width: 10px;
-            height: 10px;
-            border-radius: 50%;
-            background: #e94560;
-            transition: background 0.3s;
-        }
-        .status-dot.connected { background: #4ecca3; }
+
+        /* ---- Toolbar ---- */
         .toolbar {
             display: flex;
             align-items: center;
             gap: 16px;
-            padding: 12px 24px;
-            background: #16213e;
-            border-bottom: 1px solid #0f3460;
-            width: 100%;
+            padding: 8px 20px;
+            background: #fff;
+            border-bottom: 1px solid #e0e0e0;
+            flex-shrink: 0;
+            height: 48px;
         }
-        .toolbar label {
-            font-size: 0.8rem;
-            color: #a0a0b0;
+
+        .toolbar .brand {
+            font-size: 0.95rem;
+            font-weight: 600;
+            color: #111;
+            letter-spacing: 0.5px;
+            margin-right: 8px;
         }
-        .toolbar input[type="color"] {
-            width: 36px;
-            height: 28px;
-            border: none;
+
+        .toolbar .sep {
+            width: 1px;
+            height: 20px;
+            background: #e0e0e0;
+        }
+
+        /* Color swatches */
+        .colors { display: flex; gap: 4px; }
+        .colors .swatch {
+            width: 20px;
+            height: 20px;
+            border-radius: 4px;
+            border: 1.5px solid #ddd;
+            cursor: pointer;
+            transition: border-color 0.1s;
+        }
+        .colors .swatch:hover { border-color: #999; }
+        .colors .swatch.active { border-color: #333; box-shadow: 0 0 0 1px #333; }
+
+        /* Width slider */
+        .width-group {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .width-group label {
+            font-size: 0.75rem;
+            color: #888;
+        }
+        .width-group input[type="range"] {
+            width: 72px;
+            accent-color: #333;
+        }
+        .width-group .val {
+            font-size: 0.75rem;
+            color: #555;
+            min-width: 16px;
+            text-align: center;
+        }
+
+        /* Buttons */
+        .btn {
+            padding: 4px 12px;
+            background: #fff;
+            color: #555;
+            border: 1px solid #ddd;
             border-radius: 4px;
             cursor: pointer;
-            background: transparent;
+            font-size: 0.75rem;
+            transition: background 0.1s, border-color 0.1s;
         }
-        .toolbar input[type="range"] {
-            width: 100px;
-            accent-color: #e94560;
+        .btn:hover { background: #f9f9f9; border-color: #bbb; }
+
+        .spacer { flex: 1; }
+
+        /* Status */
+        .status {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 0.75rem;
+            color: #888;
         }
-        .toolbar .width-val {
-            font-size: 0.8rem;
-            color: #e94560;
-            min-width: 24px;
-        }
-        .toolbar button {
-            padding: 6px 16px;
-            background: #e94560;
-            color: white;
-            border: none;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: 0.8rem;
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            flex-shrink: 0;
             transition: background 0.2s;
         }
-        .toolbar button:hover { background: #c73650; }
-        .canvas-wrap {
+        .status-dot.green  { background: #34a853; }
+        .status-dot.yellow { background: #f9ab00; }
+        .status-dot.red    { background: #ea4335; }
+
+        /* ---- Canvas ---- */
+        .canvas-area {
             flex: 1;
             display: flex;
             align-items: center;
             justify-content: center;
-            padding: 16px;
-            width: 100%;
+            position: relative;
+            background: #f0f0f0;
         }
+
         canvas {
-            background: #ffffff;
-            border-radius: 8px;
-            box-shadow: 0 4px 20px rgba(0,0,0,0.4);
+            background: #fff;
             cursor: crosshair;
-            max-width: 100%;
+            border: 1px solid #e0e0e0;
         }
-        footer {
-            padding: 8px;
-            font-size: 0.7rem;
-            color: #555;
+
+        /* Overlay */
+        .overlay {
+            position: absolute;
+            inset: 0;
+            background: rgba(245,245,245,0.92);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            z-index: 10;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.2s;
         }
+        .overlay.visible { opacity: 1; pointer-events: auto; }
+        .overlay .spinner {
+            width: 24px;
+            height: 24px;
+            border: 2px solid #ddd;
+            border-top-color: #333;
+            border-radius: 50%;
+            animation: spin 0.7s linear infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .overlay p { font-size: 0.8rem; color: #999; }
     </style>
 </head>
 <body>
-    <header>
-        <h1>Inkraft</h1>
-        <div class="status">
-            <div class="status-dot" id="statusDot"></div>
-            <span id="statusText">Connecting...</span>
-        </div>
-    </header>
 
-    <div class="toolbar">
-        <label>Color</label>
-        <input type="color" id="colorPicker" value="#000000">
+<div class="toolbar">
+    <span class="brand">Inkraft</span>
+    <div class="sep"></div>
+
+    <div class="colors" id="colorPalette"></div>
+    <div class="sep"></div>
+
+    <div class="width-group">
         <label>Width</label>
-        <input type="range" id="widthSlider" min="1" max="20" value="3">
-        <span class="width-val" id="widthVal">3</span>
-        <button id="clearBtn">Clear</button>
+        <input type="range" id="widthSlider" min="1" max="10" value="3">
+        <span class="val" id="widthVal">3</span>
     </div>
 
-    <div class="canvas-wrap">
-        <canvas id="board" width="1000" height="600"></canvas>
+    <div class="sep"></div>
+    <button class="btn" id="clearBtn">Clear</button>
+
+    <span class="spacer"></span>
+
+    <div class="status">
+        <div class="status-dot red" id="statusDot"></div>
+        <span id="statusText">Connecting…</span>
     </div>
+</div>
 
-    <footer>Distributed real-time drawing board powered by Raft consensus</footer>
+<div class="canvas-area">
+    <canvas id="board" width="800" height="600"></canvas>
+    <div class="overlay" id="overlay">
+        <div class="spinner"></div>
+        <p>Reconnecting…</p>
+    </div>
+</div>
 
-    <script>
-        const canvas = document.getElementById('board');
-        const ctx = canvas.getContext('2d');
-        const statusDot = document.getElementById('statusDot');
-        const statusText = document.getElementById('statusText');
-        const colorPicker = document.getElementById('colorPicker');
-        const widthSlider = document.getElementById('widthSlider');
-        const widthVal = document.getElementById('widthVal');
-        const clearBtn = document.getElementById('clearBtn');
+<script>
+(function () {
+    "use strict";
 
-        let drawing = false;
-        let lastX = 0, lastY = 0;
-        let ws = null;
+    const COLORS = ["#000000","#dc3545","#0d6efd","#198754","#fd7e14","#6f42c1","#6c757d","#ffffff"];
+    const RECONNECT_MS = 2000;
 
-        widthSlider.addEventListener('input', () => {
-            widthVal.textContent = widthSlider.value;
+    const canvas     = document.getElementById("board");
+    const ctx        = canvas.getContext("2d");
+    const statusDot  = document.getElementById("statusDot");
+    const statusText = document.getElementById("statusText");
+    const widthSlider= document.getElementById("widthSlider");
+    const widthVal   = document.getElementById("widthVal");
+    const clearBtn   = document.getElementById("clearBtn");
+    const overlay    = document.getElementById("overlay");
+    const palette    = document.getElementById("colorPalette");
+
+    let ws = null, drawing = false, lastX = 0, lastY = 0;
+    let selectedColor = COLORS[0], selectedWidth = 3;
+    const renderedIndices = new Set();
+    let strokeHistory = [];
+
+    // Build palette
+    COLORS.forEach((c, i) => {
+        const el = document.createElement("div");
+        el.className = "swatch" + (i === 0 ? " active" : "");
+        el.style.background = c;
+        el.addEventListener("click", () => {
+            palette.querySelectorAll(".swatch").forEach(s => s.classList.remove("active"));
+            el.classList.add("active");
+            selectedColor = c;
         });
+        palette.appendChild(el);
+    });
 
-        clearBtn.addEventListener('click', () => {
-            ctx.clearRect(0, 0, canvas.width, canvas.height);
-        });
+    widthSlider.addEventListener("input", () => {
+        selectedWidth = parseInt(widthSlider.value, 10);
+        widthVal.textContent = selectedWidth;
+    });
 
-        function drawLine(x0, y0, x1, y1, color, width) {
-            ctx.beginPath();
-            ctx.moveTo(x0, y0);
-            ctx.lineTo(x1, y1);
-            ctx.strokeStyle = color;
-            ctx.lineWidth = width;
-            ctx.lineCap = 'round';
-            ctx.lineJoin = 'round';
-            ctx.stroke();
+    clearBtn.addEventListener("click", () => {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+    });
+
+    function drawLine(x0, y0, x1, y1, color, width) {
+        ctx.beginPath();
+        ctx.moveTo(x0, y0);
+        ctx.lineTo(x1, y1);
+        ctx.strokeStyle = color;
+        ctx.lineWidth = width;
+        ctx.lineCap = "round";
+        ctx.lineJoin = "round";
+        ctx.stroke();
+    }
+
+    function replayHistory(strokes) {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        renderedIndices.clear();
+        strokeHistory = strokes;
+        for (const s of strokes) {
+            drawLine(s.x0, s.y0, s.x1, s.y1, s.color, s.width);
+            if (s.index !== undefined) renderedIndices.add(s.index);
         }
+    }
 
-        function connect() {
-            const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-            ws = new WebSocket(`${protocol}//${location.host}/ws`);
+    function getPos(e) {
+        const r = canvas.getBoundingClientRect();
+        return { x: (e.clientX - r.left) * (canvas.width / r.width), y: (e.clientY - r.top) * (canvas.height / r.height) };
+    }
+    function getTouchPos(e) {
+        const t = e.touches[0], r = canvas.getBoundingClientRect();
+        return { x: (t.clientX - r.left) * (canvas.width / r.width), y: (t.clientY - r.top) * (canvas.height / r.height) };
+    }
 
-            ws.onopen = () => {
-                statusDot.classList.add('connected');
-                statusText.textContent = 'Connected';
-            };
+    canvas.addEventListener("mousedown", e => { drawing = true; const p = getPos(e); lastX = p.x; lastY = p.y; });
+    canvas.addEventListener("mousemove", e => { if (!drawing) return; const p = getPos(e); sendStroke(lastX, lastY, p.x, p.y); lastX = p.x; lastY = p.y; });
+    canvas.addEventListener("mouseup", () => { drawing = false; });
+    canvas.addEventListener("mouseleave", () => { drawing = false; });
 
-            ws.onclose = () => {
-                statusDot.classList.remove('connected');
-                statusText.textContent = 'Disconnected — reconnecting...';
-                setTimeout(connect, 1000);
-            };
+    canvas.addEventListener("touchstart", e => { e.preventDefault(); drawing = true; const p = getTouchPos(e); lastX = p.x; lastY = p.y; });
+    canvas.addEventListener("touchmove", e => { e.preventDefault(); if (!drawing) return; const p = getTouchPos(e); sendStroke(lastX, lastY, p.x, p.y); lastX = p.x; lastY = p.y; });
+    canvas.addEventListener("touchend", () => { drawing = false; });
+    canvas.addEventListener("touchcancel", () => { drawing = false; });
 
-            ws.onerror = () => {
-                ws.close();
-            };
+    function sendStroke(x0, y0, x1, y1) {
+        drawLine(x0, y0, x1, y1, selectedColor, selectedWidth);
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: "stroke", x0, y0, x1, y1, color: selectedColor, width: selectedWidth }));
+        }
+    }
 
-            ws.onmessage = (event) => {
-                const msg = JSON.parse(event.data);
+    function setStatus(state, text) {
+        statusDot.className = "status-dot " + state;
+        statusText.textContent = text;
+    }
 
-                if (msg.type === 'stroke') {
+    function connect() {
+        const proto = location.protocol === "https:" ? "wss:" : "ws:";
+        ws = new WebSocket(proto + "//" + location.host + "/ws");
+
+        ws.onopen = () => {
+            document.getElementById("overlay").classList.remove("visible");
+            setStatus("green", "Connected");
+            ws.send(JSON.stringify({ type: "get_history" }));
+        };
+        ws.onclose = () => {
+            setStatus("yellow", "Reconnecting…");
+            document.getElementById("overlay").classList.add("visible");
+            setTimeout(connect, RECONNECT_MS);
+        };
+        ws.onerror = () => { ws.close(); };
+
+        ws.onmessage = e => {
+            const msg = JSON.parse(e.data);
+            switch (msg.type) {
+                case "leader_changed":
+                    setStatus("green", "Leader: " + msg.leader);
+                    break;
+                case "no_leader":
+                    setStatus("red", "No leader");
+                    break;
+                case "stroke":
+                    if (msg.index !== undefined && renderedIndices.has(msg.index)) break;
+                    if (msg.index !== undefined) renderedIndices.add(msg.index);
                     drawLine(msg.x0, msg.y0, msg.x1, msg.y1, msg.color, msg.width);
-                } else if (msg.type === 'connected') {
-                    statusText.textContent = msg.message;
-                } else if (msg.type === 'leader_changed') {
-                    statusText.textContent = `Leader: ${msg.leader}`;
-                }
-            };
-        }
-
-        function getPos(e) {
-            const rect = canvas.getBoundingClientRect();
-            const scaleX = canvas.width / rect.width;
-            const scaleY = canvas.height / rect.height;
-            return {
-                x: (e.clientX - rect.left) * scaleX,
-                y: (e.clientY - rect.top) * scaleY
-            };
-        }
-
-        canvas.addEventListener('mousedown', (e) => {
-            drawing = true;
-            const pos = getPos(e);
-            lastX = pos.x;
-            lastY = pos.y;
-        });
-
-        canvas.addEventListener('mousemove', (e) => {
-            if (!drawing) return;
-            const pos = getPos(e);
-            const stroke = {
-                type: 'stroke',
-                x0: lastX, y0: lastY,
-                x1: pos.x, y1: pos.y,
-                color: colorPicker.value,
-                width: parseFloat(widthSlider.value)
-            };
-
-            // Draw locally for immediate feedback
-            drawLine(stroke.x0, stroke.y0, stroke.x1, stroke.y1, stroke.color, stroke.width);
-
-            // Send to gateway
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify(stroke));
+                    strokeHistory.push(msg);
+                    break;
+                case "history":
+                    if (msg.strokes && msg.strokes.length > 0) replayHistory(msg.strokes);
+                    break;
             }
+        };
+    }
 
-            lastX = pos.x;
-            lastY = pos.y;
-        });
-
-        canvas.addEventListener('mouseup', () => { drawing = false; });
-        canvas.addEventListener('mouseleave', () => { drawing = false; });
-
-        // Touch support
-        canvas.addEventListener('touchstart', (e) => {
-            e.preventDefault();
-            drawing = true;
-            const touch = e.touches[0];
-            const pos = getPos(touch);
-            lastX = pos.x;
-            lastY = pos.y;
-        });
-
-        canvas.addEventListener('touchmove', (e) => {
-            e.preventDefault();
-            if (!drawing) return;
-            const touch = e.touches[0];
-            const pos = getPos(touch);
-            const stroke = {
-                type: 'stroke',
-                x0: lastX, y0: lastY,
-                x1: pos.x, y1: pos.y,
-                color: colorPicker.value,
-                width: parseFloat(widthSlider.value)
-            };
-            drawLine(stroke.x0, stroke.y0, stroke.x1, stroke.y1, stroke.color, stroke.width);
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify(stroke));
-            }
-            lastX = pos.x;
-            lastY = pos.y;
-        });
-
-        canvas.addEventListener('touchend', () => { drawing = false; });
-
-        connect();
-    </script>
+    connect();
+})();
+</script>
 </body>
 </html>
