@@ -16,6 +16,7 @@ services:
       - REPLICA_ID=1
       - PORT=8001
       - PEERS=http://replica2:8002,http://replica3:8003
+      - GATEWAY_URL=http://gateway:9000
     volumes:
       - ./replica1:/app
     networks:
@@ -32,6 +33,7 @@ services:
       - REPLICA_ID=2
       - PORT=8002
       - PEERS=http://replica1:8001,http://replica3:8003
+      - GATEWAY_URL=http://gateway:9000
     volumes:
       - ./replica2:/app
     networks:
@@ -48,6 +50,7 @@ services:
       - REPLICA_ID=3
       - PORT=8003
       - PEERS=http://replica1:8001,http://replica2:8002
+      - GATEWAY_URL=http://gateway:9000
     volumes:
       - ./replica3:/app
     networks:
@@ -60,8 +63,11 @@ services:
     platform: linux/amd64
     ports:
       - "9000:9000"
+    environment:
+      - REPLICAS=http://replica1:8001,http://replica2:8002,http://replica3:8003
     volumes:
       - ./gateway:/app
+      - ./frontend:/frontend
     depends_on:
       - replica1
       - replica2
