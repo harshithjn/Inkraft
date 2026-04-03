@@ -29,7 +29,7 @@ Browser ──WS──▶ Gateway :9000 ──HTTP──▶ Leader Replica
 
 ## Run it
 ```bash
-git clone https://github.com/yourname/inkraft
+git clone https://github.com/harshithjn/inkraft
 cd inkraft
 docker compose up
 # Open http://localhost:9000
